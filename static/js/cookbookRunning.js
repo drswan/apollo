@@ -8,6 +8,8 @@ import uiModule from './ui.js';
 import { _diagnose, _showDiagnosis, _clearDiagnosis } from './cookbook-diagnosis.js';
 import { registerMenuDismiss } from './escMenuStack.js';
 import { computeProgressSignal } from './cookbookProgressSignal.js';
+import { parseXetProgress } from './cookbookXetProgress.js';
+import { downloadBadgeText } from './cookbookDownloadBadge.js';
 import { portOf, nextFreePort } from './cookbookPorts.js';
 import { topPortalZ } from './toolWindowZOrder.js';
 
@@ -21,17 +23,10 @@ function _statusLabel(status, type) {
   return status || '';
 }
 
-function _downloadBadgeText(progress) {
-  const raw = String(progress || '').trim();
-  if (!raw) return 'downloading';
-  const pct = raw.match(/(\d+)%/);
-  if (pct) return pct[0];
-  if (/^(?:Downloading|Fetching|Resuming)\s+'[^']+'\s+to\s+'[^']+/i.test(raw)
-    || /^Downloading\s*\(incomplete\b/i.test(raw)) {
-    return 'downloading';
-  }
-  return raw;
-}
+// Last badge text the live poll computed per download session (it parses the
+// full snapshot, so it knows the real %). Re-renders reuse it via
+// downloadBadgeText so the badge doesn't flip to the backend's raw line.
+const _liveDlBadge = new Map();
 
 // Single source of truth for what a task's status badge shows + its style class.
 // Crucially, a serve task that's still coming up shows its live phase
@@ -42,7 +37,7 @@ function _downloadBadgeText(progress) {
 function _taskBadge(task) {
   if (task._unreachable && task.status === 'running') return { text: 'unreachable', cls: 'cookbook-task-error' };
   if (task.type === 'download' && task.status === 'running') {
-    return { text: _downloadBadgeText(task.progress), cls: 'cookbook-task-downloading' };
+    return { text: downloadBadgeText(task.progress, _liveDlBadge.get(task.sessionId)), cls: 'cookbook-task-downloading' };
   }
   if (task.type === 'serve' && task.status === 'running' && task.progress) {
     // Same green "running" pill — just with dynamic phase text, so it doesn't
@@ -3334,7 +3329,10 @@ async function _reconnectTask(el, task) {
             const pctMatches = [...snapshot.matchAll(/(\d+)%\|/g)];
             const lastPct = pctMatches.length ? pctMatches[pctMatches.length - 1][1] : null;
             const speedMatch = [...snapshot.matchAll(/([\d.]+)(?:MB|GB)\/s/g)];
-            const lastSpeed = speedMatch.length ? speedMatch[speedMatch.length - 1][0] : null;
+            // hf >= 1.x (Xet): the last MB/s on screen is Reconstructing's lagging
+            // write rate; take the network rate from "Downloading bytes" instead.
+            const _xet = parseXetProgress(snapshot);
+            const lastSpeed = _xet ? _xet.speed : (speedMatch.length ? speedMatch[speedMatch.length - 1][0] : null);
             // hf_transfer prints "Downloading (incomplete total...): 73% | 1.81G/2.49G"
             // — the real aggregate byte progress. The "Fetching N files" line (often
             // last in the output) sits at 0%, so lastPct/_fetchPct can read 0 even at
@@ -3351,7 +3349,9 @@ async function _reconnectTask(el, task) {
             // 97%-stuck download went undetected). Bytes are the honest signal; fall
             // back to %/aggregate only when no byte counter is present.
             const _byteMatches = [...snapshot.matchAll(/([\d.]+\s?[KMGT])B?\s*\/\s*[\d.]+\s?[KMGT]B?/gi)];
-            const _bytes = _byteMatches.length ? _byteMatches[_byteMatches.length - 1][1].replace(/\s/g, '') : null;
+            // Xet: the only "X / Y" counter is Reconstructing's, which freezes for
+            // minutes while bytes still arrive - use the Downloading bytes count.
+            const _bytes = _xet ? _xet.downloaded : (_byteMatches.length ? _byteMatches[_byteMatches.length - 1][1].replace(/\s/g, '') : null);
             // When there's no byte counter (pip resolve / native build phase of a
             // dependency install), key off the output tail so new build lines count
             // as progress — otherwise a long quiet build is falsely declared stale
@@ -3443,7 +3443,10 @@ async function _reconnectTask(el, task) {
             // so on a resumed download it reflects the true overall progress,
             // whereas completed/totalFiles only see this session's files (→ 0%).
             // Take the higher of the two so resume doesn't read as 0%.
-            if (_useShardAgg) {
+            if (_xet && _xet.pct != null) {
+              badge.textContent = `${_xet.pct}% · ${_xet.speed}`;
+              badge.className = 'cookbook-task-status cookbook-task-downloading';
+            } else if (_useShardAgg) {
               // Multi-shard download: compute TRUE overall as completed shards
               // plus the current shard's fraction. _dlAgg / lastPct represent
               // *this shard's* progress, not the whole download.
@@ -3455,7 +3458,7 @@ async function _reconnectTask(el, task) {
               let text = `${overallPct}%`;
               if (lastSpeed) text += ` · ${lastSpeed}`;
               badge.textContent = text;
-              badge.className = 'cookbook-task-status cookbook-task-running';
+              badge.className = 'cookbook-task-status cookbook-task-downloading';
             } else if (_dlAgg != null) {
               // Real aggregate byte progress — most accurate; take the max of all signals.
               let pct = _dlAgg;
@@ -3463,7 +3466,7 @@ async function _reconnectTask(el, task) {
               let text = `${pct}%`;
               if (lastSpeed) text += ` · ${lastSpeed}`;
               badge.textContent = text;
-              badge.className = 'cookbook-task-status cookbook-task-running';
+              badge.className = 'cookbook-task-status cookbook-task-downloading';
             } else if (totalFiles > 0 && completed < totalFiles) {
               const curFilePct = lastPct ? parseInt(lastPct) / 100 : 0;
               let overallPct = Math.round(((completed + curFilePct) / totalFiles) * 100);
@@ -3471,17 +3474,18 @@ async function _reconnectTask(el, task) {
               let text = `${overallPct}%`;
               if (lastSpeed) text += ` · ${lastSpeed}`;
               badge.textContent = text;
-              badge.className = 'cookbook-task-status cookbook-task-running';
+              badge.className = 'cookbook-task-status cookbook-task-downloading';
             } else if (_fetchPct != null && _fetchPct < 100) {
               // Resume start: only the aggregate is meaningful yet.
               let text = `${_fetchPct}%`;
               if (lastSpeed) text += ` · ${lastSpeed}`;
               badge.textContent = text;
-              badge.className = 'cookbook-task-status cookbook-task-running';
+              badge.className = 'cookbook-task-status cookbook-task-downloading';
             } else if (completed > 0 && completed >= totalFiles) {
               badge.textContent = 'finishing';
-              badge.className = 'cookbook-task-status cookbook-task-running';
+              badge.className = 'cookbook-task-status cookbook-task-downloading';
             }
+            if (/\d+%/.test(badge.textContent)) _liveDlBadge.set(task.sessionId, badge.textContent);
             if (snapshot.includes('DOWNLOAD_FAILED')) {
               // The wrapper prints DOWNLOAD_FAILED but exits 0, and per-file
               // "Download complete"/"100%" lines make it look successful — so
@@ -4362,7 +4366,7 @@ async function _pollBackgroundStatus() {
             statusEl.textContent = 'cooking';
           }
         } else {
-          const _dlText = _downloadBadgeText(t.progress);
+          const _dlText = downloadBadgeText(t.progress, _liveDlBadge.get(t.sessionId));
           statusEl.textContent = _dlText === 'downloading' ? 'downloading' : `downloading ${_dlText}`;
         }
         statusEl.style.display = '';
