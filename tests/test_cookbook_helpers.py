@@ -743,6 +743,58 @@ def test_llama_cpp_hip_build_omits_target_when_undetected(tmp_path):
     assert out == "|"
 
 
+def _run_load_mode_shim(tmp_path, args, new_binary=True):
+    """Call the generated llama-server function against a stub binary that
+    prints its argv (one per line)."""
+    import subprocess
+    from routes.cookbook_helpers import _append_llama_server_load_mode_compat_lines
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    help_text = "-lm, --load-mode MODE" if new_binary else "--mmap, --no-mmap"
+    stub = bindir / "llama-server"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = "--help" ]; then echo "{help_text}"; exit 0; fi\n'
+        'for a in "$@"; do echo "$a"; done\n'
+    )
+    stub.chmod(0o755)
+    lines = []
+    _append_llama_server_load_mode_compat_lines(lines)
+    script = "\n".join(lines + ['llama-server "$@"'])
+    out = subprocess.run(
+        ["bash", "-c", script, "bash", *args],
+        env={"PATH": f"{bindir}:/usr/bin:/bin"},
+        capture_output=True, text=True, check=True,
+    )
+    return [l for l in out.stdout.splitlines() if not l.startswith("[odysseus]")]
+
+
+def test_llama_server_no_mmap_maps_to_load_mode_none(tmp_path):
+    out = _run_load_mode_shim(tmp_path, ["-m", "a b.gguf", "--no-mmap", "--port", "8000"])
+    assert out == ["-m", "a b.gguf", "--port", "8000", "--load-mode", "none"]
+
+
+def test_llama_server_mlock_combinations(tmp_path):
+    assert _run_load_mode_shim(tmp_path, ["--mlock"])[-2:] == ["--load-mode", "mmap+mlock"]
+    (tmp_path / "bin").rename(tmp_path / "bin1")
+    assert _run_load_mode_shim(tmp_path, ["--no-mmap", "--mlock"]) == ["--load-mode", "mlock"]
+
+
+def test_llama_server_legacy_binary_passes_flags_through(tmp_path):
+    args = ["--no-mmap", "--chat-template-kwargs", '{"k":"v"}']
+    assert _run_load_mode_shim(tmp_path, args, new_binary=False) == args
+
+
+def test_llama_server_explicit_load_mode_untouched(tmp_path):
+    args = ["--load-mode", "dio", "--no-mmap"]
+    assert _run_load_mode_shim(tmp_path, args) == args
+
+
+def test_llama_server_no_legacy_flags_adds_nothing(tmp_path):
+    assert _run_load_mode_shim(tmp_path, ["-ngl", "99"]) == ["-ngl", "99"]
+
+
 def test_llama_cpp_hip_build_keeps_existing_hip_tree():
     runner_lines = []
     _append_llama_cpp_linux_accel_build_lines(runner_lines)

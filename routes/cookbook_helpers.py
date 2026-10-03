@@ -1040,6 +1040,44 @@ def _append_llama_cpp_linux_accel_build_lines(runner_lines: list[str]) -> None:
     runner_lines.append('  fi  # end _odysseus_have_prebuilt guard')
 
 
+def _append_llama_server_load_mode_compat_lines(runner_lines: list[str]) -> None:
+    """Shadow ``llama-server`` with a shell function that maps the legacy
+    ``--no-mmap`` / ``--mmap`` / ``--mlock`` flags to ``--load-mode``.
+
+    Newer llama.cpp replaced those flags with ``-lm/--load-mode`` and rejects
+    the old ones ("invalid argument: --no-mmap"). The Cookbook builds from
+    llama.cpp master, so the binary may be either generation. The function
+    only rewrites when the binary's ``--help`` lists ``--load-mode`` and the
+    command has no explicit ``--load-mode``; otherwise args pass through.
+    """
+    runner_lines.append('llama-server() {')
+    runner_lines.append('  local _ody_bin')
+    runner_lines.append('  _ody_bin="$(type -P llama-server)" || { echo "llama-server: command not found" >&2; return 127; }')
+    runner_lines.append('  case " $* " in *" --load-mode "*|*" -lm "*) "$_ody_bin" "$@"; return ;; esac')
+    runner_lines.append('  if ! "$_ody_bin" --help 2>&1 | grep -q -- "--load-mode"; then "$_ody_bin" "$@"; return; fi')
+    runner_lines.append('  local _ody_args=() _ody_mmap="" _ody_mlock=""')
+    runner_lines.append('  for _ody_a in "$@"; do')
+    runner_lines.append('    case "$_ody_a" in')
+    runner_lines.append('      --no-mmap) _ody_mmap=0 ;;')
+    runner_lines.append('      --mmap) _ody_mmap=1 ;;')
+    runner_lines.append('      --mlock) _ody_mlock=1 ;;')
+    runner_lines.append('      *) _ody_args+=("$_ody_a") ;;')
+    runner_lines.append('    esac')
+    runner_lines.append('  done')
+    runner_lines.append('  local _ody_mode=""')
+    runner_lines.append('  if [ "$_ody_mlock" = 1 ]; then')
+    runner_lines.append('    if [ "$_ody_mmap" = 0 ]; then _ody_mode=mlock; else _ody_mode=mmap+mlock; fi')
+    runner_lines.append('  elif [ "$_ody_mmap" = 0 ]; then _ody_mode=none')
+    runner_lines.append('  elif [ "$_ody_mmap" = 1 ]; then _ody_mode=mmap')
+    runner_lines.append('  fi')
+    runner_lines.append('  if [ -n "$_ody_mode" ]; then')
+    runner_lines.append('    echo "[odysseus] llama-server uses --load-mode; passing --load-mode $_ody_mode instead of the legacy mmap/mlock flags."')
+    runner_lines.append('    _ody_args+=(--load-mode "$_ody_mode")')
+    runner_lines.append('  fi')
+    runner_lines.append('  "$_ody_bin" "${_ody_args[@]}"')
+    runner_lines.append('}')
+
+
 def _llama_cpp_rebuild_cmd(update_source: bool = False) -> str:
     """Shell command that clears the Cookbook-managed llama.cpp build.
 

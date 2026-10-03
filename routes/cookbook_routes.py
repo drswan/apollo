@@ -2290,6 +2290,7 @@ def setup_cookbook_routes() -> APIRouter:
                 runner_lines.append('    ODYSSEUS_PREFLIGHT_EXIT=127')
                 runner_lines.append('  fi')
                 runner_lines.append('fi')
+                _append_llama_server_load_mode_compat_lines(runner_lines)
             elif re.search(r"\bollama\s+serve\b", req.cmd):
                 handled_ollama_serve = True
                 _ollama_default_host = "0.0.0.0" if remote else "127.0.0.1"
