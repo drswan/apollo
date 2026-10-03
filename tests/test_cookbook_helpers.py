@@ -770,6 +770,14 @@ def _run_load_mode_shim(tmp_path, args, new_binary=True):
     return [l for l in out.stdout.splitlines() if not l.startswith("[odysseus]")]
 
 
+def test_cookbook_routes_imports_load_mode_compat_helper():
+    """model_serve calls the helper; a missing import is a NameError at serve time."""
+    import routes.cookbook_routes as routes_mod
+    from routes.cookbook_helpers import _append_llama_server_load_mode_compat_lines
+
+    assert routes_mod._append_llama_server_load_mode_compat_lines is _append_llama_server_load_mode_compat_lines
+
+
 def test_llama_server_no_mmap_maps_to_load_mode_none(tmp_path):
     out = _run_load_mode_shim(tmp_path, ["-m", "a b.gguf", "--no-mmap", "--port", "8000"])
     assert out == ["-m", "a b.gguf", "--port", "8000", "--load-mode", "none"]
