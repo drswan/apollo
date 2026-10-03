@@ -1,0 +1,40 @@
+# AMD GPU overlay for Docker Desktop on Windows (WSL2 backend).
+# Enable in .env (Windows uses ';' as the COMPOSE_FILE separator):
+#   COMPOSE_FILE=docker-compose.yml;docker/gpu.amd-wsl.yml
+#
+# WSL2 has no /dev/kfd or /dev/dri, so docker/gpu.amd.yml cannot work here.
+# The GPU is exposed through the DirectX paravirtualization device /dev/dxg,
+# plus the Windows driver's user-mode libs that WSL mounts at /usr/lib/wsl.
+# Requires an AMD Adrenalin driver with WSL ROCm support.
+#
+# ROCm on WSL = ROCm userspace + librocdxg (HSA thunk over /dev/dxg). Neither
+# ships in the image; both live in host-persisted dirs so a container
+# recreate keeps them. Setup steps: website/setup.md ("AMD on Windows").
+#   - librocdxg + WSL amd-smi: debs from github.com/ROCm/librocdxg releases,
+#     extracted (dpkg-deb -x) into ${APP_DATA_DIR}/rocdxg/root
+#   - ROCm runtime: pip --user into /app/.local (persisted ./data/local)
+services:
+  odysseus:
+    devices:
+      - /dev/dxg
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm:/opt/rocm:ro
+      - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm-wsl:/opt/rocm-wsl:ro
+      - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm/share/rocdxg:/usr/share/rocdxg:ro
+    environment:
+      # _rocm_sdk_core/lib: runtime libs (libamdhip64.so.7 ...) for anything
+      # built with hipcc, e.g. Cookbook's llama.cpp HIP build.
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib:/opt/rocm/lib:/opt/rocm-wsl/lib:/app/.local/lib/python3.14/site-packages/_rocm_sdk_core/lib
+      # SDK root from `rocm-sdk path --root` (after `rocm-sdk init`), so
+      # CMake/hipcc find HIP the way they would under /opt/rocm. Only
+      # present when rocm[devel] is installed.
+      - ROCM_PATH=/app/.local/lib/python3.14/site-packages/_rocm_sdk_devel
+      - HIP_PATH=/app/.local/lib/python3.14/site-packages/_rocm_sdk_devel
+      - CMAKE_PREFIX_PATH=/app/.local/lib/python3.14/site-packages/_rocm_sdk_devel
+      # rocm-wsl first: the pip ROCm SDK ships a native amd-smi (needs
+      # /dev/kfd) in /app/.local/bin that must not shadow the WSL build.
+      - PATH=/opt/rocm-wsl/bin:/app/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+      - PYTHONPATH=/opt/rocm-wsl/share/amd_smi
+      # Only needed by ROCm < 7.13; harmless on newer releases.
+      - HSA_ENABLE_DXG_DETECTION=1

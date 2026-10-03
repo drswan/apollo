@@ -276,6 +276,37 @@ COMPOSE_FILE=docker-compose.yml:docker/gpu.amd.yml
 RENDER_GID=989
 ```
 
+**AMD on Windows (Docker Desktop / WSL2).** WSL2 has no `/dev/kfd` or
+`/dev/dri`, so `docker/gpu.amd.yml` cannot work there. The GPU is reached
+through `/dev/dxg` with ROCm userspace plus
+[librocdxg](https://github.com/ROCm/librocdxg). Requires an Adrenalin driver
+with WSL ROCm support. Neither piece ships in the image; both persist under
+`data/`:
+
+1. Download `rocdxg-roct_<ver>_amd64.deb` and `rocdxg-amd-smi-lib_<ver>_amd64.deb`
+   from the librocdxg releases and extract them (in WSL or any Debian container):
+
+   ```bash
+   for d in rocdxg-*.deb; do dpkg-deb -x "$d" data/rocdxg/root; done
+   ```
+
+2. Enable the overlay in `.env` (`;` is the Windows separator):
+
+   ```bash
+   COMPOSE_FILE=docker-compose.yml;docker/gpu.amd-wsl.yml
+   ```
+
+3. Install the ROCm runtime for your GPU target (`gfx1100` = RX 7900 series)
+   into the persisted user site:
+
+   ```bash
+   docker compose exec odysseus pip install --user --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,device-gfx1100]"
+   ```
+
+4. Verify: `docker compose exec odysseus rocminfo | grep -m1 gfx`. The
+   Cookbook GPU probe and hardware fit then detect the card through
+   `rocminfo` / `amd-smi`.
+
 For NVIDIA/AMD GPU support, also read the comments in the selected overlay file: docker/gpu.nvidia.yml or docker/gpu.amd.yml.
 
 **Stack-management UIs (Portainer, Coolify, Dockhand, etc.).** These tools
