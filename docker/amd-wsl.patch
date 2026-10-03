@@ -194,6 +194,43 @@ index 00000000..2f541b3d
 +  if (xet) return `${xet.downloaded} · ${xet.speed}`;
 +  return raw;
 +}
+diff --git a/static/js/cookbookResumeInclude.js b/static/js/cookbookResumeInclude.js
+new file mode 100644
+index 00000000..358ac8b5
+--- /dev/null
++++ b/static/js/cookbookResumeInclude.js
+@@ -0,0 +1,31 @@
++// static/js/cookbookResumeInclude.js
++/**
++ * Include filter for resuming a cached model's download. Without one, `hf
++ * download <repo>` pulls every file: for a GGUF repo that is every quant
++ * (e.g. 94.7 GB instead of the 11.6 GB Q4_K_M that was asked for).
++ *
++ * 1. The include of the latest Cookbook download task for this repo.
++ * 2. Else the single quant shared by the GGUF files already in the cache.
++ * 3. Else null: unknown, the caller must warn that the whole repo downloads.
++ *
++ * Pure so it's unit-testable under node.
++ */
++const _QUANT_RE = /(?:^|[-_./])((?:UD-)?(?:IQ[1-8]_[A-Z0-9]+|Q[2-8]_K_[MLS]|Q[2-8]_K|Q[2-8]_[0-9]|MXFP4|BF16|F16|F32))(?=[-_./]|$)/i;
++
++export function resumeIncludeFor(repo, tasks, ggufFiles) {
++  const fromTask = (Array.isArray(tasks) ? tasks : [])
++    .filter(t => t && t.type === 'download' && t.payload?.repo_id === repo && t.payload?.include)
++    .sort((a, b) => (b.ts || 0) - (a.ts || 0))[0];
++  if (fromTask) return fromTask.payload.include;
++
++  const quants = new Set();
++  for (const f of (Array.isArray(ggufFiles) ? ggufFiles : [])) {
++    const m = String(f).replace(/\.gguf$/i, '').match(_QUANT_RE);
++    quants.add(m ? m[1].toUpperCase() : null);
++  }
++  if (quants.size === 1) {
++    const [q] = quants;
++    if (q) return `*${q}*`;
++  }
++  return null;
++}
 diff --git a/static/js/cookbookRunning.js b/static/js/cookbookRunning.js
 index 2dc9089b..a66666d3 100644
 --- a/static/js/cookbookRunning.js
@@ -322,6 +359,48 @@ index 2dc9089b..a66666d3 100644
            statusEl.textContent = _dlText === 'downloading' ? 'downloading' : `downloading ${_dlText}`;
          }
          statusEl.style.display = '';
+diff --git a/static/js/cookbookServe.js b/static/js/cookbookServe.js
+index 631929ca..250064fb 100644
+--- a/static/js/cookbookServe.js
++++ b/static/js/cookbookServe.js
+@@ -12,6 +12,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
+ import { openCookbookDependencies } from './cookbook-diagnosis.js';
+ import { _hwfitCache } from './cookbook-hwfit.js';
+ import { topPortalZ } from './toolWindowZOrder.js';
++import { resumeIncludeFor } from './cookbookResumeInclude.js';
+ 
+ // Shared state/functions injected by init()
+ let _envState;
+@@ -3915,17 +3916,26 @@ async function _promptResumeIncompleteModel(m, itemEl = null) {
+     return;
+   }
+ 
++  // Keep the original file filter: a bare `hf download <repo>` pulls every
++  // file, which for a GGUF repo is every quant (tens of GB more than asked).
++  let tasks = [];
++  try { tasks = (await import('./cookbookRunning.js'))._loadTasks(); } catch {}
++  const include = resumeIncludeFor(repo, tasks, m?.gguf_files);
++  const scope = include
++    ? `Only files matching ${include} will be downloaded.`
++    : 'The original file filter is unknown, so this downloads EVERY file in the repo (for a GGUF repo: every quant).';
+   const ok = await uiModule.styledConfirm(
+-    `${short} is not finished downloading.\n\nResume the download on the selected cache server?`,
++    `${short} is not finished downloading.\n\n${scope}\n\nResume the download on the selected cache server?`,
+     { confirmText: 'Resume download', cancelText: 'Not now' }
+   );
+   if (!ok) return;
+   uiModule.showToast?.(`Resuming ${short}…`);
+-  _retryCachedModel(repo, m);
++  _retryCachedModel(repo, m, include);
+ }
+ 
+-function _retryCachedModel(repo, m) {
++function _retryCachedModel(repo, m, include = null) {
+   const payload = { repo_id: repo };
++  if (include) payload.include = include;
+   if (_envState.hfToken) payload.hf_token = _envState.hfToken;
+   const _target = _serverFromCacheSelection();
+   const srv = _target.server || {};
 diff --git a/static/js/cookbookXetProgress.js b/static/js/cookbookXetProgress.js
 new file mode 100644
 index 00000000..4c9c3489
