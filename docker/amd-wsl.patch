@@ -1,0 +1,372 @@
+diff --git a/routes/cookbook_routes.py b/routes/cookbook_routes.py
+index d3d0e36d..1246e5c3 100644
+--- a/routes/cookbook_routes.py
++++ b/routes/cookbook_routes.py
+@@ -3085,6 +3085,33 @@ def setup_cookbook_routes() -> APIRouter:
+                 gpus[0]["busy"] = True
+         return gpus
+ 
++    async def _probe_amd_rocm_tools(host: str | None, ssh_port: str | None) -> list[dict]:
++        """AMD fallback for hosts without an amdgpu sysfs tree (WSL2 /dev/dxg
++        via librocdxg): names from rocminfo, live VRAM from amd-smi."""
++        from services.hwfit.hardware import parse_amd_smi_mem_usage, parse_rocminfo_gpus
++        ri_out, err = await _run_gpu_shell("rocminfo 2>/dev/null", host, ssh_port, timeout=10)
++        agents = parse_rocminfo_gpus(ri_out) if err is None else []
++        if not agents:
++            return []
++        smi_out, smi_err = await _run_gpu_shell(
++            "amd-smi metric --mem-usage --json 2>/dev/null", host, ssh_port, timeout=10,
++        )
++        mem = parse_amd_smi_mem_usage(smi_out) if smi_err is None else []
++        gpus = []
++        for i, agent in enumerate(agents):
++            m = mem[i] if i < len(mem) else None
++            total_mb = m["total_mb"] if m else int(agent["vram_bytes"] / (1024 * 1024))
++            used_mb = m["used_mb"] if m else 0
++            free_mb = m["free_mb"] if m else total_mb
++            gpus.append({
++                "index": i, "name": agent["name"], "uuid": f"rocm-{i}",
++                "free_mb": free_mb, "total_mb": total_mb, "used_mb": used_mb,
++                "util_pct": 0, "busy": bool(total_mb and (free_mb / total_mb) < 0.5),
++                "processes": [], "backend": "rocm", "source": "rocminfo",
++                "unified_memory": False,
++            })
++        return gpus
++
+     async def _probe_apple_unified_memory(host: str | None, ssh_port: str | None) -> dict | None:
+         """Best-effort Apple Silicon unified-memory probe, local or over SSH."""
+         cmd = (
+@@ -3273,7 +3300,7 @@ def setup_cookbook_routes() -> APIRouter:
+             apple_gpus["nvidia_error"] = nvidia_error
+             return apple_gpus
+ 
+-        amd_gpus = await _probe_amd_sysfs(host, ssh_port)
++        amd_gpus = await _probe_amd_sysfs(host, ssh_port) or await _probe_amd_rocm_tools(host, ssh_port)
+         if amd_gpus:
+             # The per-GPU dict already carries the runtime label picked by
+             # _probe_amd_sysfs (rocm vs vulkan); mirror that into the
+@@ -3284,7 +3311,7 @@ def setup_cookbook_routes() -> APIRouter:
+                 "ok": True,
+                 "gpus": amd_gpus,
+                 "backend": _amd_wrap_backend,
+-                "source": "amd-sysfs",
++                "source": amd_gpus[0].get("source") or "amd-sysfs",
+                 "fallback_from": "nvidia-smi",
+                 "nvidia_error": nvidia_error,
+             }
+diff --git a/services/hwfit/hardware.py b/services/hwfit/hardware.py
+index f63c072b..9a0ea653 100644
+--- a/services/hwfit/hardware.py
++++ b/services/hwfit/hardware.py
+@@ -202,10 +202,74 @@ def classify_amd_gfx(gfx):
+     return gfx, "unknown"
+ 
+ 
++def parse_rocminfo_gpus(text):
++    """Extract GPU agents from `rocminfo` output.
++
++    Returns [{"name", "gfx", "vram_bytes"}] in agent order. CPU agents are
++    skipped; VRAM is the first GLOBAL pool's Size (reported in KB).
++    """
++    gpus = []
++    for block in re.split(r"^\s*Agent \d+\s*$", text or "", flags=re.MULTILINE)[1:]:
++        if not re.search(r"^\s*Device Type:\s*GPU\s*$", block, re.MULTILINE):
++            continue
++        gfx = re.search(r"^\s*Name:\s*(gfx\w+)\s*$", block, re.MULTILINE)
++        name = re.search(r"^\s*Marketing Name:\s*(.+?)\s*$", block, re.MULTILINE)
++        pool = re.search(r"Segment:\s*GLOBAL[^\n]*\n\s*Size:\s*(\d+)", block)
++        gpus.append({
++            "name": name.group(1) if name else (gfx.group(1) if gfx else "AMD GPU"),
++            "gfx": gfx.group(1) if gfx else "",
++            "vram_bytes": int(pool.group(1)) * 1024 if pool else 0,
++        })
++    return gpus
++
++
++def parse_amd_smi_mem_usage(text):
++    """Parse `amd-smi metric --mem-usage --json` into per-GPU VRAM in MB.
++
++    Returns [{"index", "total_mb", "used_mb", "free_mb"}]; [] on bad input.
++    Accepts both {"gpu_data": [...]} and the older bare-list shape.
++    """
++    try:
++        data = json.loads(text or "")
++    except ValueError:
++        return []
++    if isinstance(data, dict):
++        data = data.get("gpu_data") or []
++    if not isinstance(data, list):
++        return []
++
++    def _mb(mem, key):
++        val = (mem.get(key) or {}).get("value") if isinstance(mem.get(key), dict) else mem.get(key)
++        try:
++            return int(float(val))
++        except (TypeError, ValueError):
++            return None
++
++    out = []
++    for i, row in enumerate(data):
++        mem = (row or {}).get("mem_usage") or {}
++        total = _mb(mem, "total_vram")
++        if not total:
++            continue
++        used = _mb(mem, "used_vram") or 0
++        free = _mb(mem, "free_vram")
++        out.append({
++            "index": row.get("gpu", i),
++            "total_mb": total,
++            "used_mb": used,
++            "free_mb": free if free is not None else max(0, total - used),
++        })
++    return out
++
++
+ def _detect_amd():
+     """Detect AMD GPUs. Handles both discrete cards (with mem_info_vram_total)
+     and APUs / unified-memory SoCs like Strix Halo (which expose
+-    mem_info_vis_vram_total instead, or only mem_info_gtt_total)."""
++    mem_info_vis_vram_total instead, or only mem_info_gtt_total).
++
++    Falls back to rocminfo GPU agents when no DRM card exists — e.g. WSL2 /
++    Docker Desktop, where the GPU is reached via /dev/dxg + librocdxg and
++    there is no amdgpu sysfs tree."""
+     def _read(path):
+         if _remote_host:
+             val = _run(["cat", path])
+@@ -266,6 +330,13 @@ def _detect_amd():
+             name = _read(f"{base}/product_name") or f"AMD GPU ({entry})"
+             cards.append({"index": _cidx, "name": name, "vram_gb": vram_bytes / (1024**3)})
+ 
++        if not cards:
++            info = _run(["rocminfo"]) or _run(["/opt/rocm/bin/rocminfo"]) or ""
++            cards = [
++                {"index": i, "name": g["name"], "vram_gb": g["vram_bytes"] / (1024**3)}
++                for i, g in enumerate(parse_rocminfo_gpus(info))
++                if g["vram_bytes"] > 0
++            ]
+         if not cards:
+             return None
+         total_vram = sum(c["vram_gb"] for c in cards)
+@@ -880,6 +951,10 @@ def detect_system(host="", ssh_port="", platform="", fresh=False):
+             # Apple Silicon / AMD APUs share system RAM with the GPU — carry the
+             # flag through so callers can tell unified from discrete VRAM.
+             "unified_memory": gpu_info.get("unified_memory", False),
++            # AMD ISA/family (see classify_amd_gfx) — fit.py's consumer-RDNA
++            # GGUF-only filter keys off gpu_family.
++            "gpu_arch": gpu_info.get("gpu_arch"),
++            "gpu_family": gpu_info.get("gpu_family"),
+         }
+     else:
+         backend = "cpu_arm" if cpu_arch == "arm64" else "cpu_x86"
+diff --git a/static/js/cookbookDownloadBadge.js b/static/js/cookbookDownloadBadge.js
+new file mode 100644
+index 00000000..2f541b3d
+--- /dev/null
++++ b/static/js/cookbookDownloadBadge.js
+@@ -0,0 +1,29 @@
++// static/js/cookbookDownloadBadge.js
++import { parseXetProgress } from './cookbookXetProgress.js';
++
++/**
++ * Badge text for a running download. Shared by the live poll and every list
++ * re-render so the badge doesn't flip between two labels.
++ *
++ * live: the last text the live poll computed from the full tmux snapshot
++ *   (e.g. "14% · 7.9MB/s"). It knows the real %, so it wins when present.
++ * progress: the backend's last progress line (task.progress). Fallback after
++ *   a page reload, before the first poll.
++ *
++ * Pure so it's unit-testable under node.
++ */
++export function downloadBadgeText(progress, live) {
++  if (live) return live;
++  const raw = String(progress || '').trim();
++  if (!raw) return 'downloading';
++  const pct = raw.match(/(\d+)%/);
++  if (pct) return pct[0];
++  if (/^(?:Downloading|Fetching|Resuming)\s+'[^']+'\s+to\s+'[^']+/i.test(raw)
++    || /^Downloading\s*\(incomplete\b/i.test(raw)) {
++    return 'downloading';
++  }
++  // hf >= 1.x Xet line has no %; show bytes + speed instead of the raw bar.
++  const xet = parseXetProgress(raw);
++  if (xet) return `${xet.downloaded} · ${xet.speed}`;
++  return raw;
++}
+diff --git a/static/js/cookbookRunning.js b/static/js/cookbookRunning.js
+index 2dc9089b..a66666d3 100644
+--- a/static/js/cookbookRunning.js
++++ b/static/js/cookbookRunning.js
+@@ -8,6 +8,8 @@ import uiModule from './ui.js';
+ import { _diagnose, _showDiagnosis, _clearDiagnosis } from './cookbook-diagnosis.js';
+ import { registerMenuDismiss } from './escMenuStack.js';
+ import { computeProgressSignal } from './cookbookProgressSignal.js';
++import { parseXetProgress } from './cookbookXetProgress.js';
++import { downloadBadgeText } from './cookbookDownloadBadge.js';
+ import { portOf, nextFreePort } from './cookbookPorts.js';
+ import { topPortalZ } from './toolWindowZOrder.js';
+ 
+@@ -21,17 +23,10 @@ function _statusLabel(status, type) {
+   return status || '';
+ }
+ 
+-function _downloadBadgeText(progress) {
+-  const raw = String(progress || '').trim();
+-  if (!raw) return 'downloading';
+-  const pct = raw.match(/(\d+)%/);
+-  if (pct) return pct[0];
+-  if (/^(?:Downloading|Fetching|Resuming)\s+'[^']+'\s+to\s+'[^']+/i.test(raw)
+-    || /^Downloading\s*\(incomplete\b/i.test(raw)) {
+-    return 'downloading';
+-  }
+-  return raw;
+-}
++// Last badge text the live poll computed per download session (it parses the
++// full snapshot, so it knows the real %). Re-renders reuse it via
++// downloadBadgeText so the badge doesn't flip to the backend's raw line.
++const _liveDlBadge = new Map();
+ 
+ // Single source of truth for what a task's status badge shows + its style class.
+ // Crucially, a serve task that's still coming up shows its live phase
+@@ -42,7 +37,7 @@ function _downloadBadgeText(progress) {
+ function _taskBadge(task) {
+   if (task._unreachable && task.status === 'running') return { text: 'unreachable', cls: 'cookbook-task-error' };
+   if (task.type === 'download' && task.status === 'running') {
+-    return { text: _downloadBadgeText(task.progress), cls: 'cookbook-task-downloading' };
++    return { text: downloadBadgeText(task.progress, _liveDlBadge.get(task.sessionId)), cls: 'cookbook-task-downloading' };
+   }
+   if (task.type === 'serve' && task.status === 'running' && task.progress) {
+     // Same green "running" pill — just with dynamic phase text, so it doesn't
+@@ -3334,7 +3329,10 @@ async function _reconnectTask(el, task) {
+             const pctMatches = [...snapshot.matchAll(/(\d+)%\|/g)];
+             const lastPct = pctMatches.length ? pctMatches[pctMatches.length - 1][1] : null;
+             const speedMatch = [...snapshot.matchAll(/([\d.]+)(?:MB|GB)\/s/g)];
+-            const lastSpeed = speedMatch.length ? speedMatch[speedMatch.length - 1][0] : null;
++            // hf >= 1.x (Xet): the last MB/s on screen is Reconstructing's lagging
++            // write rate; take the network rate from "Downloading bytes" instead.
++            const _xet = parseXetProgress(snapshot);
++            const lastSpeed = _xet ? _xet.speed : (speedMatch.length ? speedMatch[speedMatch.length - 1][0] : null);
+             // hf_transfer prints "Downloading (incomplete total...): 73% | 1.81G/2.49G"
+             // — the real aggregate byte progress. The "Fetching N files" line (often
+             // last in the output) sits at 0%, so lastPct/_fetchPct can read 0 even at
+@@ -3351,7 +3349,9 @@ async function _reconnectTask(el, task) {
+             // 97%-stuck download went undetected). Bytes are the honest signal; fall
+             // back to %/aggregate only when no byte counter is present.
+             const _byteMatches = [...snapshot.matchAll(/([\d.]+\s?[KMGT])B?\s*\/\s*[\d.]+\s?[KMGT]B?/gi)];
+-            const _bytes = _byteMatches.length ? _byteMatches[_byteMatches.length - 1][1].replace(/\s/g, '') : null;
++            // Xet: the only "X / Y" counter is Reconstructing's, which freezes for
++            // minutes while bytes still arrive - use the Downloading bytes count.
++            const _bytes = _xet ? _xet.downloaded : (_byteMatches.length ? _byteMatches[_byteMatches.length - 1][1].replace(/\s/g, '') : null);
+             // When there's no byte counter (pip resolve / native build phase of a
+             // dependency install), key off the output tail so new build lines count
+             // as progress — otherwise a long quiet build is falsely declared stale
+@@ -3443,7 +3443,10 @@ async function _reconnectTask(el, task) {
+             // so on a resumed download it reflects the true overall progress,
+             // whereas completed/totalFiles only see this session's files (→ 0%).
+             // Take the higher of the two so resume doesn't read as 0%.
+-            if (_useShardAgg) {
++            if (_xet && _xet.pct != null) {
++              badge.textContent = `${_xet.pct}% · ${_xet.speed}`;
++              badge.className = 'cookbook-task-status cookbook-task-downloading';
++            } else if (_useShardAgg) {
+               // Multi-shard download: compute TRUE overall as completed shards
+               // plus the current shard's fraction. _dlAgg / lastPct represent
+               // *this shard's* progress, not the whole download.
+@@ -3455,7 +3458,7 @@ async function _reconnectTask(el, task) {
+               let text = `${overallPct}%`;
+               if (lastSpeed) text += ` · ${lastSpeed}`;
+               badge.textContent = text;
+-              badge.className = 'cookbook-task-status cookbook-task-running';
++              badge.className = 'cookbook-task-status cookbook-task-downloading';
+             } else if (_dlAgg != null) {
+               // Real aggregate byte progress — most accurate; take the max of all signals.
+               let pct = _dlAgg;
+@@ -3463,7 +3466,7 @@ async function _reconnectTask(el, task) {
+               let text = `${pct}%`;
+               if (lastSpeed) text += ` · ${lastSpeed}`;
+               badge.textContent = text;
+-              badge.className = 'cookbook-task-status cookbook-task-running';
++              badge.className = 'cookbook-task-status cookbook-task-downloading';
+             } else if (totalFiles > 0 && completed < totalFiles) {
+               const curFilePct = lastPct ? parseInt(lastPct) / 100 : 0;
+               let overallPct = Math.round(((completed + curFilePct) / totalFiles) * 100);
+@@ -3471,17 +3474,18 @@ async function _reconnectTask(el, task) {
+               let text = `${overallPct}%`;
+               if (lastSpeed) text += ` · ${lastSpeed}`;
+               badge.textContent = text;
+-              badge.className = 'cookbook-task-status cookbook-task-running';
++              badge.className = 'cookbook-task-status cookbook-task-downloading';
+             } else if (_fetchPct != null && _fetchPct < 100) {
+               // Resume start: only the aggregate is meaningful yet.
+               let text = `${_fetchPct}%`;
+               if (lastSpeed) text += ` · ${lastSpeed}`;
+               badge.textContent = text;
+-              badge.className = 'cookbook-task-status cookbook-task-running';
++              badge.className = 'cookbook-task-status cookbook-task-downloading';
+             } else if (completed > 0 && completed >= totalFiles) {
+               badge.textContent = 'finishing';
+-              badge.className = 'cookbook-task-status cookbook-task-running';
++              badge.className = 'cookbook-task-status cookbook-task-downloading';
+             }
++            if (/\d+%/.test(badge.textContent)) _liveDlBadge.set(task.sessionId, badge.textContent);
+             if (snapshot.includes('DOWNLOAD_FAILED')) {
+               // The wrapper prints DOWNLOAD_FAILED but exits 0, and per-file
+               // "Download complete"/"100%" lines make it look successful — so
+@@ -4362,7 +4366,7 @@ async function _pollBackgroundStatus() {
+             statusEl.textContent = 'cooking';
+           }
+         } else {
+-          const _dlText = _downloadBadgeText(t.progress);
++          const _dlText = downloadBadgeText(t.progress, _liveDlBadge.get(t.sessionId));
+           statusEl.textContent = _dlText === 'downloading' ? 'downloading' : `downloading ${_dlText}`;
+         }
+         statusEl.style.display = '';
+diff --git a/static/js/cookbookXetProgress.js b/static/js/cookbookXetProgress.js
+new file mode 100644
+index 00000000..4c9c3489
+--- /dev/null
++++ b/static/js/cookbookXetProgress.js
+@@ -0,0 +1,42 @@
++// static/js/cookbookXetProgress.js
++/**
++ * Progress for huggingface_hub's Xet downloader (hf CLI >= 1.x), which prints:
++ *
++ *   Downloading bytes: ███▏      |  618MB, 11.2MB/s
++ *   Reconstructing (incomplete total...):   1%|  | 67.6MB / 11.6GB, 2.80MB/s
++ *   Fetching 1 files:   0%|       | 0/1 [00:00<?, ?it/s]
++ *
++ * "Downloading bytes" is the real network transfer but has no % because Xet
++ * does not know the total up front. "Reconstructing" writes the final file in
++ * order, so its %, speed and byte counter lag far behind and freeze for long
++ * stretches. Read the downloaded bytes and speed from the first line and the
++ * size from the second's "/ 11.6GB".
++ *
++ * Returns { downloaded, speed, pct } or null when there is no Xet block (old
++ * hf_transfer output keeps the existing card logic). pct is null when the size
++ * is not printed yet, and is capped at 99: the total is "incomplete" and can
++ * grow, so only the task finishing means 100%.
++ *
++ * Pure (string in, object out) so it's unit-testable under node.
++ */
++const _UNIT = { '': 1, K: 1e3, M: 1e6, G: 1e9, T: 1e12 };
++
++function _toBytes(num, unit) {
++  return parseFloat(num) * (_UNIT[(unit || '').toUpperCase()] || 1);
++}
++
++export function parseXetProgress(snapshot) {
++  // Drop line breaks without adding spaces: tmux wraps at the pane width and
++  // can split a token ("11.6G" / "B"), so rejoining keeps numbers intact.
++  const flat = String(snapshot || '').replace(/[\r\n]+/g, '');
++  const dl = [...flat.matchAll(/Downloading bytes:[^|]*\|\s*([\d.]+)\s?([KMGT]?)B,\s*([\d.]+\s?[KMGT]?B\/s)/gi)].pop();
++  if (!dl) return null;
++  const total = [...flat.matchAll(/Reconstructing[^|]*\|[^|]*\|\s*[\d.]+\s?[KMGT]?B\s*\/\s*([\d.]+)\s?([KMGT]?)B/gi)].pop();
++  const doneBytes = _toBytes(dl[1], dl[2]);
++  const totalBytes = total ? _toBytes(total[1], total[2]) : 0;
++  return {
++    downloaded: `${dl[1]}${dl[2]}B`,
++    speed: dl[3].replace(/\s/g, ''),
++    pct: totalBytes > 0 ? Math.min(99, Math.round((doneBytes / totalBytes) * 100)) : null,
++  };
++}

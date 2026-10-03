@@ -1,0 +1,14 @@
+# Thin local layer over the published image: applies the WSL2/rocdxg AMD
+# GPU detection patch (rocminfo/amd-smi fallback when /sys/class/drm has no
+# amdgpu card), plus the Cookbook download card fix for hf >= 1.x Xet
+# progress output. Built by docker/gpu.amd-wsl.yml. After a new upstream
+# release:  docker compose build --pull odysseus && docker compose up -d
+# A failing `git apply` here means the patch must be regenerated.
+ARG BASE_IMAGE=ghcr.io/odysseus-dev/odysseus:latest
+FROM ${BASE_IMAGE}
+COPY docker/amd-wsl.patch /tmp/amd-wsl.patch
+# Published image ships these files with CRLF endings; the patch is LF.
+RUN cd /app \
+    && sed -i 's/\r$//' services/hwfit/hardware.py routes/cookbook_routes.py \
+        static/js/cookbookRunning.js \
+    && git apply /tmp/amd-wsl.patch && rm /tmp/amd-wsl.patch

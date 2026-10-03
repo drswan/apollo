@@ -32,3 +32,6 @@ static/lib/** -whitespace linguist-vendored
 *.ico  binary
 *.woff binary
 *.woff2 binary
+
+# Applied with `git apply` inside a Linux image build; CRLF breaks the hunks.
+*.patch text eol=lf

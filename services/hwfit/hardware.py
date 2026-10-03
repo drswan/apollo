@@ -202,10 +202,74 @@ def classify_amd_gfx(gfx):
     return gfx, "unknown"
 
 
+def parse_rocminfo_gpus(text):
+    """Extract GPU agents from `rocminfo` output.
+
+    Returns [{"name", "gfx", "vram_bytes"}] in agent order. CPU agents are
+    skipped; VRAM is the first GLOBAL pool's Size (reported in KB).
+    """
+    gpus = []
+    for block in re.split(r"^\s*Agent \d+\s*$", text or "", flags=re.MULTILINE)[1:]:
+        if not re.search(r"^\s*Device Type:\s*GPU\s*$", block, re.MULTILINE):
+            continue
+        gfx = re.search(r"^\s*Name:\s*(gfx\w+)\s*$", block, re.MULTILINE)
+        name = re.search(r"^\s*Marketing Name:\s*(.+?)\s*$", block, re.MULTILINE)
+        pool = re.search(r"Segment:\s*GLOBAL[^\n]*\n\s*Size:\s*(\d+)", block)
+        gpus.append({
+            "name": name.group(1) if name else (gfx.group(1) if gfx else "AMD GPU"),
+            "gfx": gfx.group(1) if gfx else "",
+            "vram_bytes": int(pool.group(1)) * 1024 if pool else 0,
+        })
+    return gpus
+
+
+def parse_amd_smi_mem_usage(text):
+    """Parse `amd-smi metric --mem-usage --json` into per-GPU VRAM in MB.
+
+    Returns [{"index", "total_mb", "used_mb", "free_mb"}]; [] on bad input.
+    Accepts both {"gpu_data": [...]} and the older bare-list shape.
+    """
+    try:
+        data = json.loads(text or "")
+    except ValueError:
+        return []
+    if isinstance(data, dict):
+        data = data.get("gpu_data") or []
+    if not isinstance(data, list):
+        return []
+
+    def _mb(mem, key):
+        val = (mem.get(key) or {}).get("value") if isinstance(mem.get(key), dict) else mem.get(key)
+        try:
+            return int(float(val))
+        except (TypeError, ValueError):
+            return None
+
+    out = []
+    for i, row in enumerate(data):
+        mem = (row or {}).get("mem_usage") or {}
+        total = _mb(mem, "total_vram")
+        if not total:
+            continue
+        used = _mb(mem, "used_vram") or 0
+        free = _mb(mem, "free_vram")
+        out.append({
+            "index": row.get("gpu", i),
+            "total_mb": total,
+            "used_mb": used,
+            "free_mb": free if free is not None else max(0, total - used),
+        })
+    return out
+
+
 def _detect_amd():
     """Detect AMD GPUs. Handles both discrete cards (with mem_info_vram_total)
     and APUs / unified-memory SoCs like Strix Halo (which expose
-    mem_info_vis_vram_total instead, or only mem_info_gtt_total)."""
+    mem_info_vis_vram_total instead, or only mem_info_gtt_total).
+
+    Falls back to rocminfo GPU agents when no DRM card exists — e.g. WSL2 /
+    Docker Desktop, where the GPU is reached via /dev/dxg + librocdxg and
+    there is no amdgpu sysfs tree."""
     def _read(path):
         if _remote_host:
             val = _run(["cat", path])
@@ -266,6 +330,13 @@ def _detect_amd():
             name = _read(f"{base}/product_name") or f"AMD GPU ({entry})"
             cards.append({"index": _cidx, "name": name, "vram_gb": vram_bytes / (1024**3)})
 
+        if not cards:
+            info = _run(["rocminfo"]) or _run(["/opt/rocm/bin/rocminfo"]) or ""
+            cards = [
+                {"index": i, "name": g["name"], "vram_gb": g["vram_bytes"] / (1024**3)}
+                for i, g in enumerate(parse_rocminfo_gpus(info))
+                if g["vram_bytes"] > 0
+            ]
         if not cards:
             return None
         total_vram = sum(c["vram_gb"] for c in cards)
@@ -880,6 +951,10 @@ def detect_system(host="", ssh_port="", platform="", fresh=False):
             # Apple Silicon / AMD APUs share system RAM with the GPU — carry the
             # flag through so callers can tell unified from discrete VRAM.
             "unified_memory": gpu_info.get("unified_memory", False),
+            # AMD ISA/family (see classify_amd_gfx) — fit.py's consumer-RDNA
+            # GGUF-only filter keys off gpu_family.
+            "gpu_arch": gpu_info.get("gpu_arch"),
+            "gpu_family": gpu_info.get("gpu_family"),
         }
     else:
         backend = "cpu_arm" if cpu_arch == "arm64" else "cpu_x86"

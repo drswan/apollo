@@ -1,0 +1,42 @@
+# AMD GPU overlay for Docker Desktop on Windows (WSL2 backend).
+# Enable in .env (Windows uses ';' as the COMPOSE_FILE separator):
+#   COMPOSE_FILE=docker-compose.yml;docker/gpu.amd-wsl.yml
+#
+# WSL2 has no /dev/kfd or /dev/dri, so docker/gpu.amd.yml cannot work here.
+# The GPU is exposed through the DirectX paravirtualization device /dev/dxg,
+# plus the Windows driver's user-mode libs that WSL mounts at /usr/lib/wsl.
+#
+# ROCm on WSL = ROCm userspace + librocdxg (HSA thunk over /dev/dxg).
+# Both live in host-persisted dirs so a container recreate keeps them:
+#   - librocdxg / WSL amd-smi: debs from github.com/ROCm/librocdxg releases,
+#     extracted (dpkg-deb -x) into ${APP_DATA_DIR}/rocdxg/root
+#   - ROCm runtime: pip --user into /app/.local, e.g.
+#       pip install --user --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+#         "rocm[libraries,device-gfx1100]==7.14.0"
+# Requires an Adrenalin driver with WSL ROCm support.
+services:
+  odysseus:
+    # Published image + docker/amd-wsl.patch (rocminfo / amd-smi GPU
+    # detection fallback; stock detection only reads /sys/class/drm).
+    image: odysseus-local:amd-wsl
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.amd-wsl
+      args:
+        BASE_IMAGE: ${ODYSSEUS_IMAGE:-ghcr.io/odysseus-dev/odysseus:latest}
+    devices:
+      - /dev/dxg
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm:/opt/rocm:ro
+      - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm-wsl:/opt/rocm-wsl:ro
+      - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm/share/rocdxg:/usr/share/rocdxg:ro
+    environment:
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib:/opt/rocm/lib:/opt/rocm-wsl/lib
+      # rocm-wsl first: the pip ROCm SDK ships a native amd-smi (needs
+      # /dev/kfd) in /app/.local/bin that must not shadow the WSL build.
+      - PATH=/opt/rocm-wsl/bin:/app/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+      - PYTHONPATH=/opt/rocm-wsl/share/amd_smi
+      # Only needed by ROCm < 7.13; harmless on newer releases.
+      - HSA_ENABLE_DXG_DETECTION=1
