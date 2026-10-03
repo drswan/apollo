@@ -124,6 +124,85 @@ def test_detect_amd_reports_family(monkeypatch):
     assert info["gpu_arch"] == "gfx1200"
 
 
+_WSL_ROCMINFO = """\
+*******
+Agent 1
+*******
+  Name:                    AMD Ryzen 7 2700 Eight-Core Processor
+  Marketing Name:          AMD Ryzen 7 2700 Eight-Core Processor
+  Device Type:             CPU
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: FINE GRAINED
+      Size:                    65763136(0x3eb7e40) KB
+*******
+Agent 2
+*******
+  Name:                    gfx1100
+  Marketing Name:          AMD Radeon RX 7900 XTX
+  Device Type:             GPU
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: COARSE GRAINED
+      Size:                    25149440(0x17fc000) KB
+    Pool 2
+      Segment:                 GROUP
+      Size:                    64(0x40) KB
+"""
+
+
+def test_detect_amd_falls_back_to_rocminfo_without_drm(monkeypatch):
+    """WSL2 / Docker Desktop exposes the GPU only via /dev/dxg + librocdxg:
+    no /sys/class/drm cards exist, but rocminfo still lists the GPU agent.
+    _detect_amd must report it from rocminfo instead of returning None."""
+    def fake_run(cmd):
+        if cmd and "rocminfo" in cmd[0]:
+            return _WSL_ROCMINFO
+        if cmd and cmd[0] == "which" and cmd[1] == "rocminfo":
+            return "/app/.local/bin/rocminfo"
+        if cmd and cmd[0] == "ls":
+            return "version"
+        return None
+
+    monkeypatch.setattr(hardware, "_remote_host", "fake-host")
+    monkeypatch.setattr(hardware, "_run", fake_run)
+
+    info = hardware._detect_amd()
+    assert info is not None
+    assert info["gpu_name"] == "AMD Radeon RX 7900 XTX"
+    assert info["gpu_count"] == 1
+    assert 23.9 <= info["gpu_vram_gb"] <= 24.1
+    assert info["backend"] == "rocm"
+    assert info["gpu_arch"] == "gfx1100"
+    assert info["gpu_family"] == "rdna"
+
+
+def test_parse_rocminfo_gpus_ignores_cpu_agents():
+    gpus = hardware.parse_rocminfo_gpus(_WSL_ROCMINFO)
+    assert [(g["name"], g["gfx"]) for g in gpus] == [("AMD Radeon RX 7900 XTX", "gfx1100")]
+    assert gpus[0]["vram_bytes"] == 25149440 * 1024
+    assert hardware.parse_rocminfo_gpus("") == []
+
+
+def test_parse_amd_smi_mem_usage():
+    """WSL amd-smi (rocdxg-amd-smi-lib) is the only live-VRAM source when
+    there is no amdgpu sysfs; parse its `metric --mem-usage --json`."""
+    out = """{"gpu_data": [{"gpu": 0, "mem_usage": {
+        "total_vram": {"value": 24560, "unit": "MB"},
+        "used_vram": {"value": 1551, "unit": "MB"},
+        "free_vram": {"value": 23009, "unit": "MB"}}}]}"""
+    assert hardware.parse_amd_smi_mem_usage(out) == [
+        {"index": 0, "total_mb": 24560, "used_mb": 1551, "free_mb": 23009},
+    ]
+    # Older amd-smi emits a bare list instead of {"gpu_data": [...]}.
+    bare = '[{"gpu": 0, "mem_usage": {"total_vram": {"value": 8192, "unit": "MB"}, "used_vram": {"value": 0, "unit": "MB"}}}]'
+    assert hardware.parse_amd_smi_mem_usage(bare) == [
+        {"index": 0, "total_mb": 8192, "used_mb": 0, "free_mb": 8192},
+    ]
+    assert hardware.parse_amd_smi_mem_usage("not json") == []
+    assert hardware.parse_amd_smi_mem_usage(None) == []
+
+
 def test_detect_system_keeps_amd_family(monkeypatch):
     """detect_system must carry gpu_arch/gpu_family through, or fit.py's
     consumer-RDNA GGUF-only filter never sees them in production."""

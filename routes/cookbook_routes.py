@@ -3085,6 +3085,33 @@ def setup_cookbook_routes() -> APIRouter:
                 gpus[0]["busy"] = True
         return gpus
 
+    async def _probe_amd_rocm_tools(host: str | None, ssh_port: str | None) -> list[dict]:
+        """AMD fallback for hosts without an amdgpu sysfs tree (WSL2 /dev/dxg
+        via librocdxg): names from rocminfo, live VRAM from amd-smi."""
+        from services.hwfit.hardware import parse_amd_smi_mem_usage, parse_rocminfo_gpus
+        ri_out, err = await _run_gpu_shell("rocminfo 2>/dev/null", host, ssh_port, timeout=10)
+        agents = parse_rocminfo_gpus(ri_out) if err is None else []
+        if not agents:
+            return []
+        smi_out, smi_err = await _run_gpu_shell(
+            "amd-smi metric --mem-usage --json 2>/dev/null", host, ssh_port, timeout=10,
+        )
+        mem = parse_amd_smi_mem_usage(smi_out) if smi_err is None else []
+        gpus = []
+        for i, agent in enumerate(agents):
+            m = mem[i] if i < len(mem) else None
+            total_mb = m["total_mb"] if m else int(agent["vram_bytes"] / (1024 * 1024))
+            used_mb = m["used_mb"] if m else 0
+            free_mb = m["free_mb"] if m else total_mb
+            gpus.append({
+                "index": i, "name": agent["name"], "uuid": f"rocm-{i}",
+                "free_mb": free_mb, "total_mb": total_mb, "used_mb": used_mb,
+                "util_pct": 0, "busy": bool(total_mb and (free_mb / total_mb) < 0.5),
+                "processes": [], "backend": "rocm", "source": "rocminfo",
+                "unified_memory": False,
+            })
+        return gpus
+
     async def _probe_apple_unified_memory(host: str | None, ssh_port: str | None) -> dict | None:
         """Best-effort Apple Silicon unified-memory probe, local or over SSH."""
         cmd = (
@@ -3273,7 +3300,7 @@ def setup_cookbook_routes() -> APIRouter:
             apple_gpus["nvidia_error"] = nvidia_error
             return apple_gpus
 
-        amd_gpus = await _probe_amd_sysfs(host, ssh_port)
+        amd_gpus = await _probe_amd_sysfs(host, ssh_port) or await _probe_amd_rocm_tools(host, ssh_port)
         if amd_gpus:
             # The per-GPU dict already carries the runtime label picked by
             # _probe_amd_sysfs (rocm vs vulkan); mirror that into the
@@ -3284,7 +3311,7 @@ def setup_cookbook_routes() -> APIRouter:
                 "ok": True,
                 "gpus": amd_gpus,
                 "backend": _amd_wrap_backend,
-                "source": "amd-sysfs",
+                "source": amd_gpus[0].get("source") or "amd-sysfs",
                 "fallback_from": "nvidia-smi",
                 "nvidia_error": nvidia_error,
             }
