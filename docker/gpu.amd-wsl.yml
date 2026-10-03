@@ -32,11 +32,26 @@ services:
       - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm:/opt/rocm:ro
       - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm-wsl:/opt/rocm-wsl:ro
       - ${APP_DATA_DIR:-./data}/rocdxg/root/opt/rocm/share/rocdxg:/usr/share/rocdxg:ro
+      # ccache for the Cookbook llama.cpp HIP build (CCACHE_DIR in the image).
+      # ~/llama.cpp itself lives in the container layer and is lost on
+      # recreate; with this cache the re-clone + rebuild is mostly hits.
+      - ccache:/app/.cache/ccache
     environment:
-      - LD_LIBRARY_PATH=/usr/lib/wsl/lib:/opt/rocm/lib:/opt/rocm-wsl/lib
+      # _rocm_sdk_core/lib + _rocm_sdk_libraries/lib: runtime libs
+      # (libamdhip64.so.7, libhipblas.so.3, librocblas.so.5 ...) for anything
+      # built with hipcc, e.g. Cookbook's llama.cpp HIP build.
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib:/opt/rocm/lib:/opt/rocm-wsl/lib:/app/.local/lib/python3.14/site-packages/_rocm_sdk_core/lib:/app/.local/lib/python3.14/site-packages/_rocm_sdk_libraries/lib
+      # SDK root from `rocm-sdk path --root` (after `rocm-sdk init`), so
+      # CMake/hipcc find HIP the way they would under /opt/rocm.
+      - ROCM_PATH=/app/.local/lib/python3.14/site-packages/_rocm_sdk_devel
+      - HIP_PATH=/app/.local/lib/python3.14/site-packages/_rocm_sdk_devel
+      - CMAKE_PREFIX_PATH=/app/.local/lib/python3.14/site-packages/_rocm_sdk_devel
       # rocm-wsl first: the pip ROCm SDK ships a native amd-smi (needs
       # /dev/kfd) in /app/.local/bin that must not shadow the WSL build.
       - PATH=/opt/rocm-wsl/bin:/app/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
       - PYTHONPATH=/opt/rocm-wsl/share/amd_smi
       # Only needed by ROCm < 7.13; harmless on newer releases.
       - HSA_ENABLE_DXG_DETECTION=1
+
+volumes:
+  ccache:

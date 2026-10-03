@@ -706,6 +706,53 @@ def test_llama_cpp_linux_bootstrap_prefers_rocm_before_cuda():
     assert 'ROCm/HIP detected — building llama-server with HIP support' in script
 
 
+def _run_hip_arch_probe(tmp_path, env_arch=None, tools=None):
+    """Run the generated HIP arch-detection lines with stub GPU tools on PATH."""
+    import os
+    import subprocess
+
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    probe = [l.strip() for l in runner_lines if '_ODY_HIP_ARCH=' in l or '_ODY_HIP_ARGS=' in l]
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, output in (tools or {}).items():
+        stub = bindir / name
+        stub.write_text(f"#!/bin/sh\necho '{output}'\n")
+        stub.chmod(0o755)
+    env = {"PATH": f"{bindir}:/usr/bin:/bin"}
+    if env_arch is not None:
+        env["ODYSSEUS_HIP_ARCH"] = env_arch
+    script = "\n".join(probe + ['printf "%s|%s" "$_ODY_HIP_ARCH" "$_ODY_HIP_ARGS"'])
+    out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=True)
+    return out.stdout
+
+
+def test_llama_cpp_hip_build_pins_detected_gpu_target(tmp_path):
+    out = _run_hip_arch_probe(tmp_path, tools={"amd-smi": "    TARGET_GRAPHICS_VERSION: gfx1100"})
+    assert out == "gfx1100|-DGPU_TARGETS=gfx1100 -DAMDGPU_TARGETS=gfx1100"
+
+
+def test_llama_cpp_hip_build_arch_override_wins(tmp_path):
+    out = _run_hip_arch_probe(tmp_path, env_arch="gfx1030", tools={"rocminfo": "  Name: gfx1100"})
+    assert out == "gfx1030|-DGPU_TARGETS=gfx1030 -DAMDGPU_TARGETS=gfx1030"
+
+
+def test_llama_cpp_hip_build_omits_target_when_undetected(tmp_path):
+    out = _run_hip_arch_probe(tmp_path, tools={"rocminfo": "no agents"})
+    assert out == "|"
+
+
+def test_llama_cpp_hip_build_keeps_existing_hip_tree():
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+    hip = script[script.index('[ -n "$HIP_PATH" ]; then'):script.index('-DGGML_HIP=ON')]
+    assert "grep -qs '^GGML_HIP:BOOL=ON' build/CMakeCache.txt || rm -rf build" in hip
+    assert '\n      rm -rf build\n' not in hip
+    assert '-DGGML_HIP=ON $_ODY_HIP_ARGS' in script
+
+
 def test_llama_cpp_linux_bootstrap_checks_cudart_before_cuda_build():
     """cudart helper and all required paths must appear before the CUDA cmake command."""
     runner_lines = []

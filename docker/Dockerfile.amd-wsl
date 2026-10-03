@@ -1,7 +1,9 @@
 # Thin local layer over the published image: applies the WSL2/rocdxg AMD
 # GPU detection patch (rocminfo/amd-smi fallback when /sys/class/drm has no
 # amdgpu card), plus the Cookbook download card fix for hf >= 1.x Xet
-# progress output and the resume-download quant filter fix. Built by docker/gpu.amd-wsl.yml. After a new upstream
+# progress output, the resume-download quant filter fix, and the llama.cpp
+# HIP build speedups (pinned GPU target, resumable build tree, ccache).
+# Built by docker/gpu.amd-wsl.yml. After a new upstream
 # release:  docker compose build --pull odysseus && docker compose up -d
 # A failing `git apply` here means the patch must be regenerated.
 ARG BASE_IMAGE=ghcr.io/odysseus-dev/odysseus:latest
@@ -10,5 +12,14 @@ COPY docker/amd-wsl.patch /tmp/amd-wsl.patch
 # Published image ships these files with CRLF endings; the patch is LF.
 RUN cd /app \
     && sed -i 's/\r$//' services/hwfit/hardware.py routes/cookbook_routes.py \
+        routes/cookbook_helpers.py \
         static/js/cookbookRunning.js static/js/cookbookServe.js \
     && git apply /tmp/amd-wsl.patch && rm /tmp/amd-wsl.patch
+# ccache: llama.cpp's CMake picks it up automatically (GGML_CCACHE=ON), so a
+# re-run after an interrupted build or a source update only recompiles the
+# changed HIP objects. The cache dir is a named volume (docker/gpu.amd-wsl.yml);
+# pre-create it owned by the app user so the fresh volume inherits that owner.
+RUN apt-get update && apt-get install -y --no-install-recommends ccache \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/.cache/ccache && chown 1000:1000 /app/.cache/ccache
+ENV CCACHE_DIR=/app/.cache/ccache

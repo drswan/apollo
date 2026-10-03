@@ -1,0 +1,24 @@
+# pip --user packages (/app/.local) on a Docker named volume instead of a
+# host bind mount. Enable in .env (Windows uses ';' as the COMPOSE_FILE
+# separator):
+#   COMPOSE_FILE=docker-compose.yml;docker/gpu.amd-wsl.yml;docker/hf-volume.yml;docker/local-volume.yml
+#
+# On Docker Desktop/WSL2 the base file's ./data/local bind goes over 9p
+# (WSL -> NTFS). With the pip ROCm SDK installed there, every hipcc/clang
+# invocation of the Cookbook llama.cpp HIP build reads the compiler, HIP
+# headers and device libs through 9p. A named volume lives on ext4 inside
+# the WSL VHD.
+#
+# One-time migration of an existing ./data/local (container stopped):
+#   docker run --rm -v ./data/local:/src:ro -v odysseus_py-local:/dst \
+#     alpine sh -c "cp -a /src/. /dst/ && chown -R 1000:1000 /dst"
+#
+# Compose merges service volumes by container path, so this entry replaces
+# the base file's ./data/local bind for /app/.local.
+services:
+  odysseus:
+    volumes:
+      - py-local:/app/.local
+
+volumes:
+  py-local:
