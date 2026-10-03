@@ -880,6 +880,10 @@ def detect_system(host="", ssh_port="", platform="", fresh=False):
             # Apple Silicon / AMD APUs share system RAM with the GPU — carry the
             # flag through so callers can tell unified from discrete VRAM.
             "unified_memory": gpu_info.get("unified_memory", False),
+            # AMD ISA/family (see classify_amd_gfx) — fit.py's consumer-RDNA
+            # GGUF-only filter keys off gpu_family.
+            "gpu_arch": gpu_info.get("gpu_arch"),
+            "gpu_family": gpu_info.get("gpu_family"),
         }
     else:
         backend = "cpu_arm" if cpu_arch == "arm64" else "cpu_x86"

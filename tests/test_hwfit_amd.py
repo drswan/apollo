@@ -124,6 +124,19 @@ def test_detect_amd_reports_family(monkeypatch):
     assert info["gpu_arch"] == "gfx1200"
 
 
+def test_detect_system_keeps_amd_family(monkeypatch):
+    """detect_system must carry gpu_arch/gpu_family through, or fit.py's
+    consumer-RDNA GGUF-only filter never sees them in production."""
+    fake = {"gpu_name": "AMD Radeon RX 7900 XTX", "gpu_vram_gb": 24.0, "gpu_count": 1,
+            "backend": "rocm", "gpu_arch": "gfx1100", "gpu_family": "rdna"}
+    monkeypatch.setattr(hardware, "_detect_apple_silicon", lambda: None)
+    monkeypatch.setattr(hardware, "_detect_nvidia", lambda: None)
+    monkeypatch.setattr(hardware, "_detect_amd", lambda: fake)
+    info = hardware.detect_system(fresh=True)
+    assert info["gpu_arch"] == "gfx1100"
+    assert info["gpu_family"] == "rdna"
+
+
 def test_consumer_amd_cards_have_real_bandwidth():
     """Consumer AMD cards must be in the bandwidth table so speed estimates use
     real VRAM bandwidth, not the crude rocm FALLBACK_K constant. The RX 9060 XT
