@@ -1,0 +1,18 @@
+# HuggingFace cache on a Docker named volume instead of a host bind mount.
+# Enable in .env (Windows uses ';' as the COMPOSE_FILE separator):
+#   COMPOSE_FILE=docker-compose.yml;docker/gpu.amd-wsl.yml;docker/hf-volume.yml
+#
+# On Docker Desktop/WSL2 a bind mount of ./data/huggingface goes over 9p
+# (WSL -> NTFS), which throttles HF Xet file reconstruction to ~2 MB/s.
+# A named volume lives on ext4 inside the WSL VHD. Trade-off: the models are
+# no longer visible from Windows (inspect with `docker volume inspect`).
+#
+# Compose merges service volumes by container path, so this entry replaces
+# the base file's ./data/huggingface bind for /app/.cache/huggingface.
+services:
+  odysseus:
+    volumes:
+      - hf-cache:/app/.cache/huggingface
+
+volumes:
+  hf-cache:
