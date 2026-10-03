@@ -12,6 +12,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 import { openCookbookDependencies } from './cookbook-diagnosis.js';
 import { _hwfitCache } from './cookbook-hwfit.js';
 import { topPortalZ } from './toolWindowZOrder.js';
+import { resumeIncludeFor } from './cookbookResumeInclude.js';
 
 // Shared state/functions injected by init()
 let _envState;
@@ -3915,17 +3916,26 @@ async function _promptResumeIncompleteModel(m, itemEl = null) {
     return;
   }
 
+  // Keep the original file filter: a bare `hf download <repo>` pulls every
+  // file, which for a GGUF repo is every quant (tens of GB more than asked).
+  let tasks = [];
+  try { tasks = (await import('./cookbookRunning.js'))._loadTasks(); } catch {}
+  const include = resumeIncludeFor(repo, tasks, m?.gguf_files);
+  const scope = include
+    ? `Only files matching ${include} will be downloaded.`
+    : 'The original file filter is unknown, so this downloads EVERY file in the repo (for a GGUF repo: every quant).';
   const ok = await uiModule.styledConfirm(
-    `${short} is not finished downloading.\n\nResume the download on the selected cache server?`,
+    `${short} is not finished downloading.\n\n${scope}\n\nResume the download on the selected cache server?`,
     { confirmText: 'Resume download', cancelText: 'Not now' }
   );
   if (!ok) return;
   uiModule.showToast?.(`Resuming ${short}…`);
-  _retryCachedModel(repo, m);
+  _retryCachedModel(repo, m, include);
 }
 
-function _retryCachedModel(repo, m) {
+function _retryCachedModel(repo, m, include = null) {
   const payload = { repo_id: repo };
+  if (include) payload.include = include;
   if (_envState.hfToken) payload.hf_token = _envState.hfToken;
   const _target = _serverFromCacheSelection();
   const srv = _target.server || {};
